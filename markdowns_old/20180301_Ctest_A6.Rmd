@@ -1,0 +1,279 @@
+---
+title: "20180301_Ctest_A6"
+author: "Garrett Boudinot"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged
+    toc: yes
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+# Normal Start Functions
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load libraries
+library(tidyverse) 
+library(plotly)
+library(isoreader)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(isoprocessorCUB)
+source("functions.R")
+# set global chunk options for figure output
+figure_prefix <- "PREFIX-"
+knitr::opts_chunk$set(
+  dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path=file.path("figures", figure_prefix))
+```
+
+# Load isofiles
+```{r, message=FALSE}
+isofiles <-
+  file.path(
+    "Results",
+    c(
+      "180226_alkanes_C_GB",
+      "180228_alkanes_C_GB"
+    )
+  ) %>%
+  iso_read_continuous_flow()
+```
+
+# Data
+
+## File Info
+```{r}
+# all file info
+isofiles %>% iso_get_file_info()
+```
+
+## Vendor data table
+```{r}
+isofiles %>% iso_get_vendor_data_table()
+```
+
+## Chromatograms
+```{r, fig.width=10, fig.height=8, message=FALSE}
+isofiles %>% 
+  # fetch a few of the files of interst
+  iso_filter_files(parse_number(Analysis) %in% c(543, 550)) %>% 
+  # plot just mass 28
+  iso_plot_continuous_flow_data(data = c(46)) %>% 
+  # make interactive
+  ggplotly(dynamicTicks = TRUE)
+```
+
+# Analysis
+
+## Select relevant data
+```{r}
+data_table <-
+  isofiles %>%
+  # filter the files you want to use 
+  # --> exclude CO2 zeros
+  iso_filter_files(!str_detect(`Identifier 1`, "CO2 zero")) %>% 
+  # --> select only good analyses
+  iso_filter_files(parse_number(Analysis) > 515) %>% 
+  # get the vendor data table and file info
+  iso_get_vendor_data_table(
+    select = c(
+      # peak info
+      Nr., Start, Rt, End,
+      # amplitudes and intensities
+      `Ampl 44`, `Ampl 46`, `Intensity All`, `Intensity 44`,
+      # ratios and deltas
+      `R 46CO2/44CO2`, `d 13C/12C`
+    ),
+    include_file_info = c(
+      file_datetime, Analysis, `Identifier 1`, `Identifier 2`, `GC Method`, `Seed Oxidation`
+    )
+  ) %>% 
+  # rename some columns to be easier to work with
+  rename(
+    Ampl44=`Ampl 44`, Ampl46=`Ampl 46`, # amplitudes
+    #Area28=`rIntensity 28`, Area29=`rIntensity 29`, # areas
+    Intensity=`Intensity All`, #peak intensities
+    R46C = `R 46CO2/44CO2`, d13C = `d 13C/12C`, # ratio and delta values
+    rt = `Rt`,
+    rt_start = `Start`,
+    rt_end = `End`
+    #File = `file_id`
+  )
+data_table
+```
+
+## Map peaks
+```{r, echo=FALSE, eval=FALSE}
+# file names
+data_table$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+```{r}
+### CHANGE MAPPING FILE NAME ###
+metadata_samples <- read_excel(file.path("metadata", "20180226_GB_metadata.xlsx"), sheet = "files")
+
+metadata_peak_maps <- read_excel(file.path("metadata","20180226_GB_metadata.xlsx"), sheet = "maps")
+
+metadata_samples
+```
+```{r}
+data_table_with_peaks <- data_table %>%
+    iso_add_metadata(metadata_samples, match_by = c(`Identifier 1`, Analysis)) %>%
+    iso_map_peaks(metadata_peak_maps) 
+
+# missing and unidentified peaks
+data_table_with_peaks %>% filter(!is_identified | is_missing)
+
+# confirmed peaks
+data_table_with_peaks <- data_table_with_peaks %>%
+    filter(is_identified, !is_missing, !is_ambiguous)
+
+data_table_with_peaks
+```
+
+
+
+## Check stability of reference peaks
+The second one is the one defined to be 0 permil (so will always be), the rest is relative to that peak.
+```{r, message=FALSE, fig.width = 10, fig.height = 8}
+p <- data_table_with_peaks %>% 
+  filter(is_ref_peak == "yes") %>% 
+  ggplot() + 
+  aes(Nr., d13C, color = file_id) +
+  geom_line() + 
+  theme_bw()
+ggplotly(p)
+```
+
+## Add standard values
+```{r}
+standards <- read_excel(file.path("metadata", "gc_irms_indiana_A6.xlsx"))
+data_w_stds <- data_table_with_peaks %>% 
+  filter(type == "standard", is_ref_peak == "no") %>% 
+  left_join(standards, by = "compound") %>% 
+  mutate(is_std = !is.na(true.d13C) | !is.na(true.d2H))
+```
+
+
+# Process data
+Focus on the analytes and calculate a few summary parameters we want to use later.
+```{r}
+data_w_analyte_peaks <- 
+  data_table_with_peaks %>% 
+  # this is important so that the reference peaks are not caught up in the next set of calculations
+  filter(is_ref_peak == "no") %>% 
+  # for each analysis calculate averages across analysis
+  group_by(Analysis) %>% 
+  mutate(
+    ampl_sample_mean.mV = mean(`Ampl44`), ampl_sample_sd.mV = sd(`Ampl44`),
+    area_sample_mean.Vs = mean(`Intensity 44`), area_sample_sd.Vs = sd(`Intensity 44`)
+  )
+```
+
+## Standards
+```{r}
+standards <- read_excel(file.path("metadata", "gc_irms_indiana_A6.xlsx"))
+kable(standards)
+
+data_w_stds <-
+  data_w_analyte_peaks %>% 
+  iso_add_standards(standards)  
+```
+### Visualize standards
+```{r, fig.width = 9, fig.height=6}
+v <- data_w_stds %>% 
+  ggplot() +
+  aes(x = true.d13C, y = d13C, color = file_id) + 
+  geom_smooth(method = "lm", se = FALSE, alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+ggplotly(v)
+```
+
+## Calibration
+```{r}
+data_w_calibs <- data_w_stds %>% 
+  # prepare for calibration by defining the grouping column(s) and setting default parameters
+  iso_prepare_for_calibration(group_by = c(Analysis)) %>% 
+  iso_set_default_process_parameters(delta_residual = resid_d13C) %>% 
+  # run calibration
+  iso_calibrate_delta(model = lm(`d13C` ~ true.d13C)) %>% 
+  # pull out some columns we want generally available
+  iso_unnest_calib_data(select = c(starts_with("Id"), ampl_sample_mean.mV)) 
+
+data_w_calibs %>% 
+  iso_unnest_delta_calib_summary(keep_other_list_data = FALSE) %>% 
+  kable(digits =3)
+
+data_w_calibs %>% 
+  # pull out seed oxidation in addition
+  iso_unnest_calib_data(select = `Seed Oxidation`) %>% 
+  iso_unnest_delta_calib_coefs(select = c(-statistic), keep_other_list_data = FALSE) %>% 
+  # arrange by term and Analysis to get a quick idea of what the numbers across analyses
+  arrange(term, Analysis) %>% 
+  kable(digits = 2)
+```
+
+### Parameters
+```{r "calibration_parameters", fig.width = 8, fig.height = 8}
+data_params <- data_w_calibs %>% 
+  # pull out remaining columns we want available (some might already be pulled out but that's okay)
+  #Note: Garrett changed "Preparation" to "Seed Oxidation" - we may want a different shape variable
+  iso_unnest_calib_data(select = c(file_datetime, ampl_sample_mean.mV, `Seed Oxidation`, is_standard)) 
+  
+# visualize the delta calibration fits
+data_params %>% 
+  #NEED TO FILTER OUT SAMPLES iso_filter_files(`Identifier 1` == "A5") 
+  iso_visualize_delta_calib_fits(x = Analysis, color = `Identifier 2`, shape = `Seed Oxidation`, size = ampl_sample_mean.mV,
+                                 include_from_summary = c(adj.r.squared, deviance)) + labs(title = "parameters vs. analysis")
+
+data_params %>% 
+  iso_visualize_delta_calib_fits(x = ampl_sample_mean.mV, color = `Identifier 2`, shape = `Seed Oxidation`, size = ampl_sample_mean.mV,
+                                 include_from_summary = c(adj.r.squared, deviance)) + labs(title = "parameters vs. amplitude") 
+
+data_params %>% 
+  iso_visualize_delta_calib_fits(x = file_datetime, color = `Identifier 2`, shape = `Seed Oxidation`, size = ampl_sample_mean.mV,
+                                 include_from_summary = c(adj.r.squared, deviance)) + labs(title = "parameters vs. time")
+```
+
+```{r "interactive_calibration_parameters", fig.width = 8, fig.height = 8}
+# turn the last plot into an interactive one
+ggplotly(ggplot2::last_plot() + theme(legend.position = "none"))
+```
+
+#### Compounds
+```{r "standards_by_compound", fig.width = 8, fig.height = 8}
+data_w_calibs %>% 
+  # pull out relevant data
+  iso_unnest_calib_data(select = everything()) %>% 
+  filter(is_standard) %>% 
+  # calculate deviation from means
+  group_by(Analysis) %>% 
+  mutate(
+    `Var: residual d13C [permil]` = resid_d13C,
+    `Var: area diff from mean [%]` = (`Intensity 44`/mean(`Intensity 44`) - 1) * 100,
+    `Var: amplitude diff from mean [%]` = (`Ampl44`/mean(`Ampl44`) - 1) * 100
+  ) %>%
+  # visualize
+  iso_visualize_data(x = compound, y = starts_with("Var"), group = Analysis, color = `Identifier 2`)
+```
+
+```{r "interactive", fig.width = 8, fig.height = 8}
+ggplotly(ggplot2::last_plot())
+```
+

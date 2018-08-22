@@ -1,0 +1,295 @@
+---
+title: "20180226_C_A6"
+author: "Garrett Boudinot"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output:
+  html_document: 
+    df_print: paged
+    toc: yes
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+# Normal Start Functions
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load libraries
+library(tidyverse) 
+library(plotly)
+library(isoreader)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(isoprocessorCUB)
+source("functions.R")
+# set global chunk options for figure output
+figure_prefix <- "PREFIX-"
+knitr::opts_chunk$set(
+  dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path=file.path("figures", figure_prefix))
+```
+
+# Load isofiles
+
+```{r, message=FALSE}
+isofiles <-
+  file.path(
+    "Results",
+    c(
+      "180223_alkanes_C_GB"
+    )
+  ) %>%
+  iso_read_continuous_flow()
+```
+
+# Data
+
+## File Info
+
+```{r}
+# all file info
+isofiles %>% iso_get_file_info()
+```
+
+## Vendor data table
+
+```{r}
+isofiles %>% iso_get_vendor_data_table()
+```
+
+## Chroms
+
+```{r, fig.width=10, fig.height=8, message=FALSE}
+isofiles %>% 
+  # fetch a few of the files of interst
+  iso_filter_files(parse_number(Analysis) %in% c(502, 504, 506)) %>% 
+  # plot just mass 28
+  iso_plot_continuous_flow_data(data = c(46)) %>% 
+  # make interactive
+  ggplotly(dynamicTicks = TRUE)
+```
+
+# Analysis
+
+## Select relevant data
+
+```{r}
+data_table <-
+  isofiles %>%
+  # filter the files you want to use 
+  # --> exclude CO2 zeros
+  iso_filter_files(!str_detect(`Identifier 1`, "CO2 zero")) %>% 
+  # --> select all analyses > 490
+  iso_filter_files(parse_number(Analysis) > 490) %>% 
+  # get the vendor data table and file info
+  iso_get_vendor_data_table(
+    select = c(
+      # peak info
+      Nr., Start, Rt, End,
+      # amplitudes and intensities
+      `Ampl 44`, `Ampl 46`, `Intensity All`,
+      # ratios and deltas
+      `R 46CO2/44CO2`, `d 13C/12C`
+    ),
+    include_file_info = c(
+      file_datetime, Analysis, `Identifier 1`, `Identifier 2`, `GC Method`, `Seed Oxidation`
+    )
+  ) %>% 
+  # rename some columns to be easier to work with
+  rename(
+    Ampl44=`Ampl 44`, Ampl46=`Ampl 46`, # amplitudes
+    #Area28=`rIntensity 28`, Area29=`rIntensity 29`, # areas
+    Intensity=`Intensity All`, #peak intensities
+    R46C = `R 46CO2/44CO2`, d13C = `d 13C/12C`, # ratio and delta values
+    rt = `Rt`,
+    rt_start = `Start`,
+    rt_end = `End`
+    #File = `file_id`
+  )
+data_table
+```
+
+## Map peaks
+```{r, echo=FALSE, eval=FALSE}
+# file names
+data_table$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+```{r}
+### CHANGE MAPPING FILE NAME ###
+metadata_samples <- read_excel(file.path("metadata", "20180226_GB_metadata.xlsx"), sheet = "files")
+
+metadata_peak_maps <- read_excel(file.path("metadata","20180226_GB_metadata.xlsx"), sheet = "maps")
+
+metadata_samples
+
+#data_table_mapped <- map_peaks(data_table, metadata_file = file.path("metadata", "20180226_GB_metadata.xlsx"), quiet = FALSE)
+```
+```{r}
+data_table_with_peaks <- data_table %>%
+    iso_add_metadata(metadata_samples, match_by = c(`Identifier 1`, Analysis)) %>%
+    iso_map_peaks(metadata_peak_maps) 
+
+# missing and unidentified peaks
+data_table_with_peaks %>% filter(!is_identified | is_missing)
+
+# confirmed peaks
+data_table_with_peaks <- data_table_with_peaks %>%
+    filter(is_identified, !is_missing, !is_ambiguous)
+
+data_table_with_peaks
+```
+
+
+
+## Check stability of reference peaks
+
+The second one is the one defined to be 0 permil (so will always be), the rest is relative to that peak.
+
+```{r, message=FALSE, fig.width = 10, fig.height = 8}
+p <- data_table_with_peaks %>% 
+  filter(is_ref_peak == "yes") %>% 
+  ggplot() + 
+  aes(Nr., d13C, color = file_id) +
+  geom_line() + 
+  theme_bw()
+ggplotly(p)
+```
+
+## Add standard values
+
+```{r}
+standards <- read_excel(file.path("metadata", "gc_irms_indiana_A6.xlsx"))
+data_w_stds <- data_table_with_peaks %>% 
+  filter(type == "standard", is_ref_peak == "no") %>% 
+  left_join(standards, by = "compound") %>% 
+  mutate(is_std = !is.na(true.d13C) | !is.na(true.d2H))
+```
+
+## Evaluate standards
+
+### Visualize
+
+```{r, fig.width = 9, fig.height=6}
+v <- data_w_stds %>% 
+  ggplot() +
+  aes(x = true.d13C, y = d13C, color = file_id) + 
+  geom_smooth(method = "lm", se = FALSE, alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+ggplotly(v)
+```
+
+
+### Overview
+
+```{r}
+std_corrections <- 
+  data_w_stds %>% 
+  group_by(file_id) %>% 
+  do({
+    m <- lm(d13C ~ true.d13C, data = .)
+    data_frame(
+      offset = coefficients(m)[1],
+      slope = coefficients(m)[2],
+      delta_ref_CO = -offset/slope,
+      max_residual = max(summary(m)$residuals),
+      rss = sum(summary(m)$residuals^2),
+      r2 = summary(m)$r.squared
+    )
+  }) 
+std_corrections %>% knitr::kable(d = 3)
+```
+
+## Intensities and delta values of the analyte peaks
+
+Legend explanation:
+ - color: TRUE/black fill = new runs, FALSE/gray fill = old runs
+ - shape: 0/circle = no seed oxidation, 1/square = seed oxidation
+ - fill: Identifier 2
+
+```{r, message=FALSE, fig.width = 10, fig.height = 8}
+# delta vs amplitude
+p <- data_w_stds %>% 
+  #filter(compound == "caffeine") %>% 
+  ggplot() + 
+  aes(Ampl44, d13C, fill = `Identifier 2`, group = Analysis) +
+  geom_point() + 
+  theme_bw() +
+  scale_shape_manual(values = c(21:25, 3:4)) +
+  scale_color_manual(values = c("gray", "black")) 
+ggplotly(p, dynamicTicks = TRUE)
+
+# delta vs time
+p2 <- p %+% aes(x=file_datetime, size=Ampl44) +
+  scale_x_datetime("", date_breaks = "12 hours", date_labels = "%d %b %H:%M")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+ggplotly(p2, dynamicTicks = TRUE)
+
+# amplitude vs time
+p3 <- p2 %+% aes(y = Ampl44, size = d13C)
+ggplotly(p3, dynamicTicks = TRUE)
+```
+
+
+# Numerical Assessment
+
+```{r}
+# overall
+data_w_stds %>% 
+  filter(compound == "C21") %>% 
+  # group into old and new runs
+  # summarize information
+  summarize(
+    n_analyses = n(),
+    d13C_mean = mean(d13C),
+    d13C_sd = sd(d13C),
+    Ampl44_mean = mean(Ampl44),
+    Ampl44_sd = sd(Ampl44)
+  )
+
+# different injection volumes
+assessment <-
+  data_w_stds %>% 
+  filter(compound == "C21") %>%
+  # group into injection volume and new vs. old runs
+  group_by(`Identifier 2`) %>%
+  # summarize information
+  summarize(
+   n_analyses = n(),
+    d13C_mean = mean(d13C),
+    d13C_sd = sd(d13C),
+    Ampl44_mean = mean(Ampl44),
+    Ampl44_sd = sd(Ampl44)
+  ) %>% ungroup() %>% 
+  # sort to make it easy to see
+  arrange(`Identifier 2`)
+
+assessment
+```
+
+## Visualization
+
+```{r, fig.width=10, fig.height=7}
+p <- assessment %>% 
+  ggplot() + 
+  aes(Ampl44_mean, d13C_mean, fill = `Identifier 2`, text = n_analyses) + 
+  geom_errorbar(map = aes(ymin = d13C_mean - d13C_sd, ymax = d13C_mean + d13C_sd), show.legend = FALSE) +
+  geom_errorbarh(map = aes(xmin = Ampl44_mean - Ampl44_sd, xmax = Ampl44_mean + Ampl44_sd), show.legend = FALSE) +
+  geom_point(shape = 21, size = 4) + 
+  theme_bw() +
+  scale_color_manual(values = c("gray", "black"))
+ggplotly(p, dynamicTicks = TRUE)
+```

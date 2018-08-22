@@ -1,0 +1,88 @@
+---
+title: "d13c_alkane_model"
+author: "Garrett Boudinot"
+date: "June 29, 2018"
+output: html_document
+---
+
+```{r "load packages", message=FALSE, warning=FALSE, echo=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+rm(list = ls())
+knitr::opts_knit$set(root.dir = ".") 
+```
+
+
+#Setting up our model
+
+
+#### Here's the equations in full:
+
+ - $\delta^{13}C_DIC = (\delta^{13}C_CO2 * J_{CO2}) -((J_{bury} * \delta^{13}C_bury) + (J_{svol} * \delta^{13}C_svol))
+ - $\delta^{13}C_DIC = ((\delta^{13}C_CO2 * F_{bury}) - \delta^{13}C_bury + (\delta^{13}C_svol * r)) * J_{bury}
+
+ 
+With parameters:
+
+ - $r = J_{svol}/J_{bury}$
+ - $f_{bury} = J_{CO2}/J_{bury}$
+ 
+And individual fluxes: 
+
+ - $k = ((1/F_{bury}) * J_{svol})/(J_{CO2}*r)
+ - $J_{bury} = J_{svol}/ (((1/F_{bury}) * J_{svol}) / (J_{CO2} * k))$
+ - $J_{CO2} = (((1/F_{bury}) * J_{svol}) / (r * k))$
+ - $J_{svol} = ((J_{CO2} * r * k) / f_{bury})$
+ 
+ 
+#### Default values (data!)
+
+ - $f_{bury} = seq(0.2, 1, by = 0.2)$
+ - $r = seq(0.2, 1, by = 0.2)$
+ - $\delta^{13}C_DIC = -10$
+ - $\delta^{13}C_CO2 = -2$
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+```{r}
+# constants
+
+delta_13C_DIC = -10
+delta_13C_CO2 = -2
+delta_13C_svol = -1
+
+
+# grid of variables
+data1 <- expand.grid(
+  f_bury = seq(0.2, 1, by = 0.2) ,
+  r = seq(0.2, 1, by = 0.2),
+  delta_13C_bury = seq(-30, -25, by = 1)
+) %>% as_data_frame() %>% 
+  mutate(
+    J_bury = ((delta_13C_CO2 * f_bury) - delta_13C_bury + (delta_13C_svol * r)) / delta_13C_DIC
+  )
+
+# show the data
+data1 %>% head() %>% knitr::kable()
+```
+
+
+#### Visualize
+
+```{r}
+# base plot
+base_plot <- 
+  ggplot() +
+  aes(x = delta_13C_bury, y = J_bury, color = factor(r)) +
+  geom_line() 
+
+  
+# plotting data 1
+base_plot %+% data1
+```

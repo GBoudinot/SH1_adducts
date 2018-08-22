@@ -1,0 +1,1001 @@
+---
+title: "20180720_GB_SH1_d13Call_presentation"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(isoprocessor)
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(knitr)
+library(isoreader)
+library(gridExtra)
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+
+# Load data
+```{r, echo = FALSE}
+# load dataset
+iso_files <- iso_read_continuous_flow("Garrett_Adducts.cf.rda")
+```
+
+## Vendor data table
+
+```{r, echo = FALSE}
+vdt <- iso_files %>% 
+  # get relevant vendor data table columns and file info
+  iso_get_vendor_data_table(
+    select = c(starts_with("Amp"), everything()),
+    include_file_info = c(ox = `Seed Oxidation`, everything())
+  )
+```
+
+## Map peaks
+```{r, echo=FALSE, eval=FALSE}
+# file names
+vdt$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+## Chromatograms
+```{r, echo = FALSE, fig.width=10, fig.height=8, message=FALSE}
+iso_files %>% 
+  # fetch a few of the files of interst
+  iso_filter_files(parse_number(Analysis) %in% c(603, 595)) %>% 
+  # plot just mass 28
+  iso_plot_continuous_flow_data(data = c(46)) %>% 
+  # make interactive
+  ggplotly(dynamicTicks = TRUE)
+```
+
+## Retrieve metadata
+
+```{r, echo = FALSE}
+metadata_samples <- read_excel(file.path("metadata", "20180416_GB_metadata.xlsx"), sheet = "files")
+metadata_peak_maps <- read_excel(file.path("metadata","20180416_GB_metadata.xlsx"), sheet = "maps")
+metadata_samples
+```
+
+## Map peaks
+
+```{r, results='asis'}
+# add metadata
+data_w_metadata <- vdt %>% 
+  iso_add_metadata(metadata_samples, match_by = c(`Identifier 1`)) 
+
+# missing metadata
+data_w_metadata %>% 
+  iso_get_missing_metadata(select = c(Analysis, `Identifier 1`, map_id))
+
+# map peaks
+data_w_peaks_all <- data_w_metadata %>% 
+  # only continue with records that have metadata and are flagged for processing
+  iso_remove_missing_metadata() %>% 
+  filter(process == "yes") %>% 
+  # map peaks
+  iso_map_peaks(metadata_peak_maps, file_id = file_id, rt = Rt, rt_start = Start, rt_end = End)
+
+# problematic peaks
+prob <- data_w_peaks_all %>% 
+  iso_get_problematic_peaks(select = c(file_id, Analysis, compound, Start, Rt, End))
+
+# focus on non problematic peaks only?
+data_w_peaks <- data_w_peaks_all %>% iso_remove_problematic_peaks()
+data_w_peaks
+```
+
+## Reference peaks
+
+```{r "ref_variation", fig.width=8, fig.height=6}
+data_w_peaks %>% 
+  iso_plot_ref_peaks(
+    is_ref_condition = is_ref_peak == "yes", 
+    ratio = c(`R 13C/12C`, `R 18O/16O`),
+    group_id = `Analysis`,
+    within_group = TRUE
+  ) 
+```
+
+
+# Data processing
+
+## Focus on analytes 
+
+Focus on the analytes and calculate a few summary parameters we want to use later.
+
+```{r, echo = FALSE}
+data_w_analyte_peaks <- 
+  data_w_peaks %>% 
+  # this is important so that the reference peaks are not caught up in the next set of calculations
+  filter(is_ref_peak == "no") %>% 
+  # for each analysis calculate averages across analysis
+  group_by(file_id) %>% 
+  mutate(
+    ampl_sample_mean.mV = mean(`Ampl 44`), ampl_sample_sd.mV = sd(`Ampl 44`),
+    area_sample_mean.Vs = mean(`Intensity 44`), area_sample_sd.Vs = sd(`Intensity 44`)
+  )
+```
+
+## Evaluate Standards
+
+### Known isotope values
+
+Add known isotope values for standards.
+
+```{r, echo = FALSE}
+standards <- 
+  read_excel(file.path("metadata", "GC-IRMS standards.xlsx")) %>% 
+  mutate(type = "standard") %>% 
+  mutate(compound = str_replace(compound, "-", ""))
+standards
+
+data_w_stds <-
+  data_w_analyte_peaks %>% 
+  iso_add_standards(standards, match_by = c(type, compound))  
+data_w_stds
+```
+
+### Single analysis calibration (for QA)
+
+Determine calibrations fits for individual standard analyses.
+
+```{r, echo = FALSE}
+stds_w_calibs <- data_w_stds %>%
+  # focus on standard analyses
+  filter(type == "standard") %>%  
+  # prepare for calibration by defining the grouping column(s) 
+  iso_prepare_for_calibration(group_by = c(Analysis)) %>% 
+  # pull out additional ID columns from the nested data
+  iso_unnest_data(
+    select = c(`Analysis`, `Injection Volume` = `Identifier 2`)) %>% 
+  # run calibration
+  iso_generate_calibration(
+    model = lm(`d 13C/12C` ~ true_d13C), 
+    calibration = "d13C",
+    is_standard = is_standard,
+    # only consider the standards that actually have the 8 peaks
+    min_n_datapoints = 8
+  )
+
+# check for problematic calibrations and make note of them in the main dataset
+problematic_stds <- stds_w_calibs %>% iso_get_problematic_calibrations("d13C")
+problematic_stds
+data_w_stds <- data_w_stds %>% 
+  mutate(type = ifelse(Analysis %in% problematic_stds$Analysis,
+                       "excluded standard", type))
+
+# move forward only with good calibrations
+stds_w_calibs <- stds_w_calibs %>% iso_remove_problematic_calibrations("d13C")
+```
+
+### Calibration coefficients
+
+Look at calibration parameters (coefficients and summary) as well ad data ranges in overview table.
+
+```{r, echo = FALSE}
+# look at coefficients and summary
+stds_w_calibs %>% 
+  # pull out a little more file information
+  iso_unnest_data(select = c(`Seed Oxidation`)) %>% 
+  # unnest calibration parameters
+  iso_unnest_calibration_parameters(
+    calibration = "d13C", 
+    select_from_coefs = c(term, estimate, SE = std.error, signif),
+    select_from_summary = c(fit_R2 = adj.r.squared, fit_RMSD = deviance, residual_df = df.residual)) %>% 
+  arrange(term)
+
+# look at ranges
+stds_w_calibs %>% 
+  iso_unnest_calibration_range(
+    calibration = "d13C",
+    select = c(var, min, max)
+  ) %>% 
+  arrange(var)
+```
+
+Visualize the calibration parameters
+
+```{r "calibration_parameters", fig.width = 8, fig.height = 8}
+# unnest some of the data for plotting
+data_for_plots <- 
+  stds_w_calibs %>%
+  iso_unnest_data(
+    c(Oxidation = `Seed Oxidation`, 
+      datetime = file_datetime,
+      `Mean Amplitude` = ampl_sample_mean.mV)
+  ) 
+data_for_plots
+
+
+# parameters vs time
+data_for_plots %>%
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = datetime,
+    color = `Injection Volume`,
+    shape = Oxidation
+  )
+
+# parameter vs analysis
+data_for_plots %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = paste(Analysis),
+    color = `Injection Volume`,
+    shape = Oxidation
+  )
+
+# parameters vs amplitude
+data_for_plots %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = `Mean Amplitude`,
+    color = `Injection Volume`
+  ) 
+```
+
+
+```{r "interactive_calibration_parameters", fig.width = 8, fig.height = 8}
+# turn the last plot into an interactive one
+ggplotly(ggplot2::last_plot() + theme(legend.position = "none"))
+```
+
+### Inspect Residuals
+
+Look at residuals to see goodness of fit for the single analysis calibrations.
+
+```{r "standards_by_compound", fig.width = 8, fig.height = 8}
+stds_w_calibs %>% 
+  # pull out all data
+  iso_unnest_data(select = everything()) %>% 
+  filter(is_standard) %>% 
+  # calculate deviation from means
+  group_by(Analysis) %>% 
+  mutate(
+    `Var: residual d13C [permil]` = d13C_resid,
+    `Var: area diff from mean [%]` = (`Intensity 44`/mean(`Intensity 44`) - 1) * 100,
+    `Var: amplitude diff from mean [%]` = (`Ampl 44`/mean(`Ampl 44`) - 1) * 100
+  ) %>%
+  ungroup() %>% 
+  # visualize
+  iso_plot_data(
+    x = compound,
+    y = starts_with("Var"),
+    group = Analysis,
+    color = `Injection Volume`
+  ) +
+  # plot modifications
+  labs(x = "")
+```
+
+```{r "interactive", fig.width = 8, fig.height = 8}
+ggplotly()
+```
+
+## Gobal calibration
+
+### Test different calibration models
+
+Run global calibrations across all standards.
+
+```{r, echo = FALSE}
+#original
+data_w_calibs <- data_w_stds %>% 
+  # no grouping this time, everything is part of the global calibration
+  iso_prepare_for_calibration() %>% 
+  # run calibrations
+  iso_generate_calibration(
+    model = c(
+      # simple model
+      delta_only = lm(`d 13C/12C` ~ true_d13C),
+      # multivariate with delta and amplitude (could also check Intensity 44)
+      delta_and_ampl = lm(`d 13C/12C` ~ true_d13C + `Ampl 44`),
+      # + the delta and amplitude cross term
+      delta_cross_ampl = lm(`d 13C/12C` ~ true_d13C * `Ampl 44`),
+      # multivariate with delta and the datetime (i.e. checking for temporal drift)
+      delta_and_time = lm(`d 13C/12C` ~ true_d13C + file_datetime)
+    ), 
+    calibration = "d13C",
+    # important to identify which analyses and which peaks within those should
+    # be part of the calibration
+    is_standard = type == "standard" & is_standard
+  ) %>% 
+  iso_remove_problematic_calibrations("d13C")
+```
+
+
+Visualize the calibration parameters for the different models. 
+
+```{r "global_calibration_parameters", fig.width = 7, fig.height = 10}
+# coefficient summary table
+data_w_calibs %>% iso_unnest_calibration_parameters("d13C")
+
+# plot to look at coefficients and summary
+data_w_calibs %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C",
+    x = d13C_calib,
+    color = d13C_calib,
+    # include the significance level to gauge which model parameters matter
+    shape = signif
+  )
+```
+
+
+Garrett thinks delta and aplitude and delta cross amplitude look better
+
+```{r "global_calibration_residuals", fig.width=8, fig.height=6}
+data_w_calibs %>% 
+  iso_unnest_data(select = everything()) %>% 
+  rename(`Injection Volume` = `Identifier 2`) %>% 
+  filter(type == "standard" & is_standard) %>% 
+  # plot each standard analysis for each of the models to see the differences
+  iso_plot_data(
+    x = compound,
+    y = d13C_resid,
+    group = paste(Analysis, d13C_calib),
+    color = d13C_calib
+  ) 
+```
+
+
+### Apply calibration
+
+Apply the `delta_and_ampl` calibration. 
+
+```{r, echo = FALSE}
+data_calibrated <- data_w_calibs %>% 
+  # apply the delta_and_ampl calibration (could apply multiple and compare)
+  filter(d13C_calib == "delta_and_ampl") %>% 
+  iso_apply_calibration(
+    predict = true_d13C,
+    calibration = "d13C",
+    calculate_error = TRUE
+  ) %>% 
+  # unnest the data
+  iso_unnest_data()
+data_calibrated
+```
+
+### Inspect results
+
+The comparison of the predicted value in the standards along with the standard error in the prediction (the inherent error of the global calibration itself, which should be treated as the analytical error) can give a better sense of how precise the data is. 
+
+```{r, echo = FALSE}
+data_calibrated %>% 
+  # look only at the standards
+  filter(type == "standard" & is_standard) %>% 
+  # check for each compound (+ other run groupings if appropriate)
+  group_by(compound) %>% 
+  # generate summary table comparing the 
+  iso_generate_summary_table(
+    raw_d13C = `d 13C/12C`, 
+    true_d13C, 
+    # this is the value predicated by the calibration
+    d13C_pred = true_d13C_pred, 
+    # and this is the estimated error based on the calibration
+    d13C_error = true_d13C_pred_se
+  )
+```
+
+### Visualization
+
+Keep in mind that the calibration provides not just the predicted value of a peak but also the standard error based on the calibration and an indicator whether a predicted data point was in the calibration range or not. 
+
+```{r "data_visualization", fig.width=12, fig.height=10}
+data_calibrated %>% 
+  iso_plot_data(
+    x = Analysis, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se,
+    color = true_d13C_pred_in_range,
+    shape = type,
+    points = TRUE,
+    lines = FALSE
+  ) + 
+  # additional features beyond the default plot
+  facet_wrap(~compound, scales = "free_y") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(color = "in calib. range")
+```
+
+
+# Combine with other data for final plots
+## Remove bad chromtogram data
+```{r}
+final_data <- data_calibrated %>%
+  #filter out bad chromatograms - all are the lower amount injection, which were followed by a larger volume - keeping the larger volume injection data
+  filter(Analysis != "597") %>% # 122 depth, OG005
+  filter(Analysis != "593") %>% # 121.105, OG047
+  filter(Analysis != "612") %>% # 121.89, OG040
+  filter(Analysis != "613") %>% # 120.205, OG042-2
+  filter(Analysis != "609") %>% # 119.55, OG158
+  filter(Analysis != "595") %>% # 122.9, OG043
+  filter(type == "sample") %>%
+  filter(true_d13C_pred_in_range == TRUE) %>%
+  select(
+      # sample info
+      depth = `Depth`,  `compound`, Identifier.1 = `Identifier 1`, `ampl_sample_mean.mV`,  type, Analysis, 
+      # peak info
+       Ampl.44 = `Ampl 44`,  true_d13C_pred , true_d13C_pred_se, true_d13C_pred_in_range,  d13C_resid
+    ) %>%
+  mutate(
+    prep = "adduct"
+  )
+
+vis <- final_data %>% 
+  filter(compound %in% c("C29", "C27", "C31", "C33"))%>%
+  iso_plot_data(
+    x = depth, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se,
+    size = Ampl.44
+  ) + 
+  # additional features beyond the default plot
+  facet_grid(~compound, scales = "free") + 
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse() +
+  coord_flip()
+ggplotly(vis)
+
+```
+
+## Low res alkane data
+```{r}
+lowres <- read.csv("lowres_d13c.csv") %>% select( -X, -`measurement_info`, -`file_datetime`, -file_id) %>% mutate(prep = "non-adduct") 
+
+
+sapply(final_data, class)
+sapply(lowres, class)
+
+final_data <- bind_rows(lowres, final_data)
+```
+
+
+# Bring in complimentary data (Jones et al., 2018)
+## Inorganic geochem data
+
+```{r}
+cisotope <- read_excel(file.path("metadata", "Appendix_Table1_geochemistry.xlsx")) %>% 
+  #rename columns
+  select(depth = `Abs. depth (m)` , d13c_org = `Average δ13Corg (‰ VPDB)` )
+
+final_data <- full_join(cisotope, final_data, by = "depth")
+```
+
+## Fit to floating timescale
+```{r}
+
+timescale <- read_excel(file.path("metadata", "Appendix_Table2_SH1_agemodel.xlsx")) %>% 
+  rename(depth = `Depth`) %>%
+  arrange(depth)
+
+# extrapolation
+extrapolated_timescale <-
+  data_frame(
+    depth = final_data$depth %>% unique()
+  ) %>% 
+  filter(!is.na(depth)) %>% 
+  mutate(
+    in_range = depth <= max(timescale$depth) & depth >= min(timescale$depth),
+    Date.Ma = map_dbl(depth, function(d) {
+      fit_data <- mutate(timescale, closest = abs(d - depth)) %>% arrange(closest)
+      m <- lm(Date.Ma ~ depth, fit_data[1:10,])
+      p <- predict(m, data.frame(depth = d), se.fit = TRUE)
+      return(p$fit)
+    }) ,
+    in_range = depth <= max(timescale$depth) & depth >= min(timescale$depth),
+    ka = map_dbl(depth, function(d) {
+      fit_data <- mutate(timescale, closest = abs(d - depth)) %>% arrange(closest)
+      m <- lm(ka ~ depth, fit_data[1:10,])
+      p <- predict(m, data.frame(depth = d), se.fit = TRUE)
+      return(p$fit)
+    }))  
+    
+ggplot() + 
+  aes(depth, Date.Ma) + 
+  geom_line(data = timescale) +
+  geom_point(data = extrapolated_timescale, mapping = aes(color = in_range))
+
+alldata_w_time <- left_join(final_data, extrapolated_timescale, by = "depth")
+```
+
+
+#Compare d13C_DIC estimate with d13C_CaCO3 from Pueblo
+## Add d13C_CaCO3 from planktonic forams from Keller et al. (2004) 
+```{r}
+# Used Jones et al. (2018) d13C org curve to correlate with org curve in Keller et al.(2004) for temporal correlation
+CaCO3 <- data_frame(
+Date.Ma = c(94.56738,  94.44, 94.38, 94.2, 93.94, 93.8, 93.57702), 
+d13C = c(-0.2,  0.5, 2, 1.75, 2.5, 1, 1)
+) 
+
+# base plot
+CaCO3 %>% 
+  ggplot() +
+  aes(x = Date.Ma, y = d13C) + 
+  geom_line() +
+  geom_point() +
+  scale_x_reverse()+
+  coord_flip()
+
+
+# extrapolation
+extrapolated_carbonate <-
+  data_frame(
+    Date.Ma = alldata_w_time$Date.Ma %>% unique()
+  ) %>% 
+  filter(!is.na(Date.Ma)) %>% 
+  arrange(Date.Ma) %>%
+  mutate(
+    in_range = Date.Ma <= max(CaCO3$Date.Ma) & Date.Ma >= min(CaCO3$Date.Ma),
+    d13C = map_dbl(Date.Ma, function(d) {
+      fit_data <- mutate(CaCO3, closest = abs(d - Date.Ma)) %>% arrange(closest)
+      m <- lm(d13C ~ Date.Ma, fit_data[1:3,])
+      p <- predict(m, data.frame(Date.Ma = d), se.fit = TRUE)
+      return(p$fit)
+    }) )  
+
+extrapolated_carbonate %>%
+  ggplot() + 
+  aes( Date.Ma, d13C) + 
+  geom_line() +
+  scale_x_reverse()+
+  coord_flip()
+
+alldata_w_time <- left_join(alldata_w_time, extrapolated_carbonate, by = "Date.Ma")
+
+alldata_w_time %>%
+  ggplot()+
+  aes(Date.Ma, d13C) +
+  geom_point() +
+  geom_line() +
+  scale_x_reverse()+
+  coord_flip()
+```
+
+
+## Calculate / estimate eps_p
+```{r}
+alldata_w_time <- alldata_w_time %>%
+    mutate(
+         d13C_p_min = case_when(.$compound %in% c("C17", "C19", "C21")  ~ true_d13C_pred + 4,
+                           .$compound == "phytane" ~ true_d13C_pred + 4.4 ) ,  
+         d13C_p_max = case_when(.$compound %in% c("C17", "C19", "C21")  ~ true_d13C_pred + 8.4,
+                           .$compound == "phytane" ~ true_d13C_pred + 6.4 ) ,
+         d13C_p_avg = (d13C_p_max + d13C_p_min)/2, 
+         
+        eps_f = case_when(.$compound %in% c("C17", "C19", "C21")  ~ 24,
+                           .$compound == "phytane" ~ 25 ) ,    # from Julio's unpublished text, 22 for alkanes (cyano-plank intermediate) and 25 for phytane; Hays 2001 says 16-22 for cyanos; Pagani 2002 says 25 for phytoplankton in general;  "Goericke et al. [ 1994] calculate the likely range of eps_f for marine phytoplankton to be 25-28" (from Brigidare et al., 1997). After Modelling (below), 24 for short chains gets us closest to phytane value (assuming 25 for phytane) - has implications for makeup of community, i.e., that cyanos are lower abundance than phytoplankton
+         
+         b = 200, # per Julio's unpublished text, can sequence from [118 to 262], or use constant 170. I think at least 170, potentially higher, given modelled need for high [PO4] advection to sustain OAE2
+         
+         Ko = (2.466 * 10^-2) # solubility constant, from Weiss 1974 (tables II and III); dep. on T and Salinity, range from ~2 to ~7 over all regimes; @ ~35 C, range is from 2.1 to 2.3 across all salinities. Choosing for 30ppt (34 or lower in Hay et al., 1996; 20-32 for shallow WIS in Petersen et al., 2016) and 32C (mid range T from O'Brient et al., 2017; from Blake Nose)
+         
+    )
+```
+
+
+## Calculate / estimate eps_p using CaCO3 rather than lipids
+```{r}
+alldata_w_time <- alldata_w_time %>%
+    mutate(
+        Tk = 32 + 273.15, #T from O'brien et al 2017 d18O planktonic forams from ODP site 1050 (Blake Nose - closest in lat and long to WIS), norm to Kelvin
+         
+         eps_b = 24.12 - (9866 / Tk), # temp dependent carbon isotope fractionation of CO2 - HCO3 ; from Julio's unpublished text
+         
+         d13C_aq_CO2 = d13C - 1 + eps_b, # from Julio's unpublished text and many others e.g., Van Bentum et al., 2012 , using CaCO3 d13C from Keller et al (above chunk)
+        
+         eps_p_carb = 1000 * ((d13C_aq_CO2 + 1000)/ (d13C_p_avg + 1000) -1), # from Freeman and Hayes 1992
+        
+         CO2_aq_conc_carb = b / (eps_f - eps_p_carb) , # from Brigidare et al. 1997
+         
+         pCO2_carb = CO2_aq_conc_carb / Ko  
+        
+        )
+```
+
+## Check calcultions immediately
+```{r}
+
+alldata_w_time %>% filter(compound == "C21") %>% select(compound, eps_b, eps_p_carb,  d13C_aq_CO2, pCO2_carb) %>% kable()
+alldata_w_time %>% filter(compound == "phytane") %>% select(compound, eps_b, eps_p_carb,  d13C_aq_CO2, pCO2_carb) %>% kable()
+
+```
+
+
+## Model role of measured and fixed variables in pCO2 output
+```{r}
+data_try <- expand.grid(
+b = seq(170, 262, by = 10), 
+Ko = seq(2.2, 2.6, by = 0.2) * 10^-2,
+eps_p = 15.5,
+eps_f = seq(22, 25, by = 1)
+) %>% as_data_frame() %>%
+  mutate(
+    CO2_aq = b / (eps_f - eps_p),
+    pCO2 = CO2_aq / Ko
+)
+
+# base plot
+data_try %>%
+  iso_plot_data(x = b, y = pCO2, linetype = factor(Ko), color = factor(eps_f)) + 
+  geom_line(size = 3) +
+  theme(text = element_text(size=40)) 
+
+  
+
+```
+
+# Final plots
+
+## High res
+```{r "", fig.width=12, fig.height=10}
+
+alkane <- alldata_w_time %>% 
+  filter(compound %in% c( "C27", "C29", "C31", "C33"), true_d13C_pred_in_range == TRUE)%>%
+  filter(Identifier.1 != "OG005 AD")%>%
+  ggplot(
+    aes(
+    x = Date.Ma, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se ,
+    color = compound
+  ) )+ 
+  geom_rect( 
+    mapping = aes(
+      xmin= -Inf, 
+      xmax= 94.42,
+      ymin= -Inf,
+      ymax= Inf
+    ),
+    color = "grey",
+    fill = "grey",
+    alpha=0.5
+    ) +
+  geom_point(size =  6) +
+  geom_line()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.5, 94.34)) +
+  coord_flip() +
+  theme(text = element_text(size=40))
+ggplotly(alkane)
+
+
+alkanesh <- alldata_w_time %>% 
+  filter(compound %in% c( "C19", "C21", "phytane"), true_d13C_pred_in_range == TRUE)%>%
+  filter(Identifier.1 != "OG005 AD")%>%
+  iso_plot_data(
+    x = Date.Ma, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se ,
+    #shape = compound ,
+    color = compound
+  ) + 
+  # additional features beyond the default plot
+  #facet_grid(~compound, scales = "free") + 
+  geom_point(size = 8) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.5, 94.34)) +
+  #scale_x_continuous(limits = c(94.6, 94.3))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip() +
+    theme(text = element_text(size=40))
+ggplotly(alkanesh)
+
+
+bulkorg <-  subset(alldata_w_time) %>%
+  iso_plot_data(
+    x = Date.Ma, 
+    y = d13c_org
+  ) + 
+  # additional features beyond the default plot
+  geom_point(size = 5) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.5, 94.34)) +
+   theme(panel.grid.minor.x = element_blank())+
+  #scale_x_continuous(limits = c(-100, 120)) +
+  #coord_cartesian(xlim=c(-20, 80))+
+  coord_flip()+
+    theme(text = element_text(size=40))
+ggplot(bulkorg)
+
+grid.arrange(bulkorg, alkane, ncol = 2)
+```
+
+## Low res (all)
+```{r "", fig.width=12, fig.height=10}
+alkaneall <- alldata_w_time %>% 
+  filter(compound %in% c("pristane", "phytane", "C19", "C21"), true_d13C_pred_in_range == TRUE)%>%
+  iso_plot_data(
+    x = Date.Ma, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se ,
+    color = compound
+  ) + 
+  # additional features beyond the default plot
+  #facet_grid(~compound, scales = "free", space = "free") + 
+  geom_point(size = 5) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.6,  93.6 )) +
+  #scale_x_continuous()+
+  scale_y_continuous() +
+  coord_flip() +
+   theme(text = element_text(size=40))
+
+ggplotly(alkaneall)
+
+bulkorgall <-  subset(alldata_w_time) %>%
+  iso_plot_data(
+    x = Date.Ma, 
+    y = d13c_org
+  ) + 
+  # additional features beyond the default plot
+  geom_point(size = 5) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.6,  93.6 )) +
+   theme(panel.grid.minor.x = element_blank())+
+  coord_flip()+
+   theme(text = element_text(size=40))
+ggplotly(bulkorgall)
+
+grid.arrange(bulkorgall, alkaneall, ncol = 2)
+```
+
+## Pool composition estimates from lipids
+```{r}
+pools <- alldata_w_time %>% 
+   filter(Identifier.1 != "OG005_F1 alkanes_122m") %>% 
+  filter(compound %in% c( "C31", "C33"))%>%
+  ggplot()+
+  facet_grid(~compound, scales = "free", space = "free") + 
+  geom_point(aes(x = Date.Ma , y = d13C_pool_avg), size = 5) +
+  #geom_errorbar(aes(x = ka , ymin = d13C_pool_min, ymax = d13C_pool_max)) +
+  #geom_errorbarh(aes(xmin = age_dev, xmax = ka , y = d13C_pool_avg)) +
+  #geom_line(aes(x = age_dev, y = d13C_pool_avg, color = "red")) +
+  #geom_line(aes(x = ka, y = d13C_pool_max)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "Inorganic pool d13C") +
+  scale_x_reverse(limits = c(94.35, 94.5)) +
+  #scale_x_continuous()+
+  scale_y_continuous() +
+  #scale_x_continuous(limits = c(94.35, 94.5)) +
+  #coord_cartesian(xlim=c(-20, 80))+
+  coord_flip()+
+  theme(text = element_text(size=40))
+ggplotly(pools)
+```
+
+## Compare pool composition estimates from lipids  with CaCO3
+```{r}
+pool_DIC_lipid <- alldata_w_time %>% 
+  filter(compound %in% c("phytane"))%>%
+  ggplot()+
+  facet_grid(~compound, scales = "free", space = "free") + 
+  geom_point(aes(x = Date.Ma , y = d13C_pool_avg)) +
+  #geom_errorbar(aes(x = ka , ymin = d13C_pool_min, ymax = d13C_pool_max)) +
+  #geom_errorbarh(aes(xmin = age_dev, xmax = ka , y = d13C_pool_avg)) +
+  #geom_line(aes(x = age_dev, y = d13C_pool_avg, color = "red")) +
+  #geom_line(aes(x = ka, y = d13C_pool_max)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "Inorganic pool d13C from lipid") +
+  scale_x_reverse() +
+  #scale_x_continuous()+
+  scale_y_continuous() +
+  #scale_x_continuous(limits = c(-100, 120)) +
+  #coord_cartesian(xlim=c(-20, 80))+
+  coord_flip()
+
+pool_DIC_carb <- alldata_w_time %>% 
+  filter(compound %in% c( "phytane"))%>%
+  ggplot()+
+  facet_grid(~compound, scales = "free", space = "free") + 
+  geom_point(aes(x = Date.Ma , y = d13C_aq_CO2)) +
+  #geom_errorbar(aes(x = ka , ymin = d13C_pool_min, ymax = d13C_pool_max)) +
+  #geom_errorbarh(aes(xmin = age_dev, xmax = ka , y = d13C_pool_avg)) +
+  #geom_line(aes(x = age_dev, y = d13C_pool_avg, color = "red")) +
+  #geom_line(aes(x = ka, y = d13C_pool_max)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "Inorganic pool d13C from CaCO3") +
+  scale_x_reverse() +
+  #scale_x_continuous()+
+  scale_y_continuous() +
+  #scale_x_continuous(limits = c(-100, 120)) +
+  #coord_cartesian(xlim=c(-20, 80))+
+  coord_flip()
+
+grid.arrange(pool_DIC_carb, pool_DIC_lipid, ncol=2)
+```
+
+## Pool estimates with temporal offset estimates
+```{r}
+pools_alttime <- alldata_w_time %>% 
+  filter(Identifier.1 != "OG005_F1 alkanes_122m") %>% #removing duplicate for 94.45 Ma (non-adducted)
+  filter(compound %in% c( "C21",  "C33"))%>%
+  ggplot()+
+  aes(x = Date.Ma , y = d13C_pool_avg, color = "red") +
+  facet_grid(~compound, scales = "free", space = "free") + 
+  geom_line() +
+  #geom_errorbar(aes(x = ka , ymin = d13C_pool_min, ymax = d13C_pool_max)) +
+  #geom_errorbarh(aes(xmin = age_dev, xmax = ka , y = d13C_pool_avg)) +
+  #geom_line(aes(x = ka, y = d13C_pool_min)) +
+  geom_line(aes(x = age_dev, y = d13C_pool_avg, color = "blue")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "Inorganic pool d13C") +
+  scale_x_reverse(limits = c(94.6, 94.3)) +
+  #scale_x_continuous()+
+  scale_y_continuous() +
+  #scale_x_continuous(limits = c(94.6, 94.55)) +
+  #coord_cartesian(xlim=c(-20, 80))+
+  coord_flip()
+
+ggplotly(pools_alttime)
+
+```
+
+
+## CO2 calculations by date
+```{r}
+alldata_w_time %>% filter(compound == "phytane") %>% select(Date.Ma, eps_p_lipid, d13C_pool_avg, true_d13C_pred, CO2_aq_conc, pCO2) %>% kable() 
+```
+
+## eps_p
+```{r}
+#using my eps_p (lipd rather than caco3)
+eps_p_lipid <- alldata_w_time %>% 
+  filter(compound %in% c( "phytane" , "C19", "C21"), true_d13C_pred_in_range == TRUE)%>% 
+  iso_plot_data(
+    x = Date.Ma, 
+    y = eps_p_lipid 
+    #y_error = true_d13C_pred_se ,
+    #shape = compound 
+    #color = prep
+  ) + 
+  # additional features beyond the default plot
+  facet_grid(~compound, scales = "free") + 
+  geom_point() +
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "eps_p_lipid") +
+  scale_x_reverse() +
+  #scale_x_continuous(limits = c(-100, 120))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip() 
+
+eps_p_carb <- alldata_w_time %>% 
+  filter(compound %in% c("C19", "C21", "phytane"), true_d13C_pred_in_range == TRUE)%>% 
+  iso_plot_data(
+    x = Date.Ma, 
+    y = eps_p_carb ,
+    #y_error = true_d13C_pred_se ,
+    #shape = compound 
+    color = compound
+  ) + 
+  # additional features beyond the default plot
+  #facet_grid(~compound, scales = "free") + 
+  geom_point(size = 5) +
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "eps_p") +
+  scale_x_reverse(limits = c(94.6,  93.6 )) +
+  #scale_x_continuous(limits = c(-100, 120))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip()+
+   theme(text = element_text(size=40))
+
+grid.arrange(eps_p_lipid, eps_p_carb, ncol = 2)
+```
+
+## pCO2
+```{r}
+#using my eps_p (lipd rather than caco3)
+pCO2 <- alldata_w_time %>% 
+  filter(compound %in% c( "phytane" , "C21"), true_d13C_pred_in_range == TRUE)%>% 
+  iso_plot_data(
+    x = Date.Ma, 
+    y = pCO2 
+    #y_error = true_d13C_pred_se ,
+    #shape = compound 
+    #color = prep
+  ) + 
+  # additional features beyond the default plot
+  facet_grid(~compound, scales = "free") + 
+  geom_point() +
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "pCO2 using lipid") +
+  scale_x_reverse() +
+  #scale_x_continuous(limits = c(-100, 120))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip() 
+ggplotly(pCO2)
+
+pCO22carb <- alldata_w_time %>% 
+  filter(compound %in% c("phytane", "C19", "C21"), true_d13C_pred_in_range == TRUE)%>% 
+  filter(Identifier.1 != "OG005 AD") %>% #removing duplicate for 94.45 Ma (non-adducted)
+  iso_plot_data(
+    x = Date.Ma, 
+    y = pCO2_carb, 
+    #y_error = true_d13C_pred_se ,
+    #shape = compound 
+    color = compound
+  ) + 
+  # additional features beyond the default plot
+  #facet_grid(~compound, scales = "free") + 
+  geom_point(size = 8) +
+  geom_line()+ 
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "pCO2") +
+  scale_x_reverse(limits = c(94.5, 94.34)) +
+  #scale_x_continuous(limits = c(-100, 120))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip() +
+   theme(text = element_text(size=40))
+ggplotly(pCO22carb)
+
+pCO2carb <- alldata_w_time %>%
+  filter(compound %in% c( "C19", "C21"), true_d13C_pred_in_range == TRUE)%>% 
+  iso_plot_data(
+    x = Date.Ma, 
+    y = pCO2_carb ,
+    #y_error = true_d13C_pred_se ,
+    #shape = compound 
+    color = compound
+  ) + 
+  # additional features beyond the default plot
+  #facet_grid(~compound, scales = "free") + 
+  geom_point(size = 5) +
+  #geom_smooth()+ 
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "pCO2 using CaCO3") +
+  scale_x_reverse()+
+  #scale_x_continuous(limits = c(-100, 120))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip()+
+   theme(text = element_text(size=20))
+  ggplotly(pCO2carb)
+
+alkane <- alldata_w_time %>% 
+  filter(compound %in% c( "C31", "C33"), true_d13C_pred_in_range == TRUE, prep == "adduct")%>%
+  ggplot()+
+  aes(
+    x = Date.Ma, 
+    y = d13C_pool_avg, 
+    #y_error = true_d13C_pred_se ,
+    shape = compound 
+    #color = prep
+  ) + 
+  # additional features beyond the default plot
+  facet_grid(~compound, scales = "free") + 
+  geom_smooth() +
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "d13C") +
+  scale_x_reverse(limits = c(94.5, 94.34)) +
+  #scale_x_continuous(limits = c(94.6, 94.3))+
+  #scale_y_continuous(limits = c(-33, -26)) +
+  coord_flip() 
+
+
+grid.arrange( pCO2, pCO2carb, ncol = 2)
+```
+
+
+
+

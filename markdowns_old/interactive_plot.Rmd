@@ -1,0 +1,23 @@
+---
+title: "Untitled"
+author: "Garrett"
+date: "7/20/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(plotly)
+load("plot_cache.rda")
+```
+
+
+```{r}
+print(p)
+```
+
+
+```{r}
+ggplotly(p)
+```
+

@@ -1,0 +1,43 @@
+---
+title: "SH1 combined"
+author: "Garrett"
+date: "8/23/2017"
+output: html_document
+---
+
+
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(knitr)
+library(readxl)
+library(tidyr)
+source("functions.R")
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "smoky_hollows_August")) ### CHANGE PLOT PREFIX ### 
+```
+
+
+```{r}
+readRDS(file.path(cache, "dataset1.rds"))
+```
+
+```{r}
+data_aug <- readRDS(file.path("cache","dataset1.rds"))
+```
+
+
+```{r}
+data1 <- readRDS(file.path("cache", "dataset1.rds")),
+data2 <- readRDS(file.path("cache", "dataset2.rds")),
+bind_rows(mutate(data1, batch_id = "id1"), mutate(data2, batch_id="id2"))
+```
+

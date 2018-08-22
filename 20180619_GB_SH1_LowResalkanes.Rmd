@@ -1,0 +1,449 @@
+---
+title: "20180619_GB_A6 and low res aliphatics"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(isoprocessor)
+library(readxl)
+library(tidyverse)
+library(plotly)
+library(isoreader)
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+
+
+# Load data
+```{r, echo = FALSE}
+# load dataset
+iso_files <- iso_read_continuous_flow("GB_SH1_lowres.cf.rda")
+```
+
+## Vendor data table
+
+```{r, echo = FALSE}
+vdt <- iso_files %>% 
+  # get relevant vendor data table columns and file info
+  iso_get_vendor_data_table(
+    select = c(starts_with("Amp"), everything()),
+    include_file_info = c(ox = `Seed Oxidation`, everything())
+  )
+```
+
+## Map peaks
+```{r, echo=FALSE, eval=FALSE}
+# file names
+vdt$`file_id` %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+## Chromatograms
+```{r, echo = FALSE, fig.width=10, fig.height=8, message=FALSE}
+
+# remove 1 @ depth: 96.09 (OG028; 493), 94.56 (OG030; 495), 122 (OG005? )
+
+
+iso_files %>% 
+  # fetch a few of the files of interst
+  iso_filter_files(parse_number(Analysis) %in% c(534, 495)) %>% 
+  # plot just mass 28
+  iso_plot_continuous_flow_data(data = c(46)) %>% 
+  # make interactive
+  ggplotly(dynamicTicks = TRUE)
+```
+
+## Retrieve metadata
+
+```{r, echo = FALSE}
+metadata_samples <- read_excel(file.path("metadata", "20180619_lowres_GB_metadatab.xlsx"), sheet = "files")
+metadata_peak_maps <- read_excel(file.path("metadata","20180619_lowres_GB_metadatab.xlsx"), sheet = "maps")
+metadata_samples
+```
+
+## Map peaks
+
+```{r, results='asis'}
+# add metadata
+data_w_metadata <- vdt %>% 
+  iso_add_metadata(metadata_samples, match_by = c(`file_id`)) 
+
+# missing metadata
+data_w_metadata %>% 
+  iso_get_missing_metadata(select = c(Analysis, `file_id`, map_id))
+
+# map peaks
+data_w_peaks_all <- data_w_metadata %>% 
+  # only continue with records that have metadata and are flagged for processing
+  iso_remove_missing_metadata() %>% 
+  filter(process == "yes") %>% 
+  # map peaks
+  iso_map_peaks(metadata_peak_maps, file_id = file_id, rt = Rt, rt_start = Start, rt_end = End)
+
+# problematic peaks
+prob <- data_w_peaks_all %>% 
+  iso_get_problematic_peaks(select = c(file_id, Analysis, compound, Start, Rt, End))
+
+# focus on non problematic peaks only
+data_w_peaks <- data_w_peaks_all %>% iso_remove_problematic_peaks()
+data_w_peaks
+```
+
+## Reference peaks
+
+```{r "ref_variation", fig.width=8, fig.height=6}
+data_w_peaks %>% 
+  iso_plot_ref_peaks(
+    is_ref_condition = is_ref_peak == "yes", 
+    ratio = c(`R 13C/12C`, `R 18O/16O`),
+    group_id = `Analysis`,
+    within_group = TRUE
+  ) 
+```
+
+
+# Data processing
+
+## Focus on analytes 
+
+Focus on the analytes and calculate a few summary parameters we want to use later.
+
+```{r, echo = FALSE}
+data_w_analyte_peaks <- 
+  data_w_peaks %>% 
+  # this is important so that the reference peaks are not caught up in the next set of calculations
+  filter(is_ref_peak == "no") %>% 
+  # for each analysis calculate averages across analysis
+  group_by(file_id) %>% 
+  mutate(
+    ampl_sample_mean.mV = mean(`Ampl 44`), ampl_sample_sd.mV = sd(`Ampl 44`),
+    area_sample_mean.Vs = mean(`Intensity 44`), area_sample_sd.Vs = sd(`Intensity 44`)
+  )
+```
+
+## Evaluate Standards
+
+### Known isotope values
+
+Add known isotope values for standards.
+
+```{r, echo = FALSE}
+standards <- 
+  read_excel(file.path("metadata", "GC-IRMS standards.xlsx")) %>% 
+  mutate(type = "standard") %>% 
+  mutate(compound = str_replace(compound, "-", ""))
+standards
+
+data_w_stds <-
+  data_w_analyte_peaks %>% 
+  iso_add_standards(standards, match_by = c(type, compound))  
+data_w_stds
+```
+
+### Single analysis calibration (for QA)
+
+Determine calibrations fits for individual standard analyses.
+
+```{r, echo = FALSE}
+stds_w_calibs <- data_w_stds %>%
+  # focus on standard analyses
+  filter(type == "standard") %>%  
+  # prepare for calibration by defining the grouping column(s) 
+  iso_prepare_for_calibration(group_by = c(Analysis)) %>% 
+  # pull out additional ID columns from the nested data
+  iso_unnest_data(
+    select = c(`Analysis`)) %>% 
+  # run calibration
+  iso_generate_calibration(
+    model = lm(`d 13C/12C` ~ true_d13C), 
+    calibration = "d13C",
+    is_standard = is_standard,
+    # only consider the standards that actually have the 8 peaks
+    min_n_datapoints = 8
+  )
+
+# check for problematic calibrations and make note of them in the main dataset
+problematic_stds <- stds_w_calibs %>% iso_get_problematic_calibrations("d13C")
+problematic_stds
+data_w_stds <- data_w_stds %>% 
+  mutate(type = ifelse(Analysis %in% problematic_stds$Analysis,
+                       "excluded standard", type))
+
+# move forward only with good calibrations
+stds_w_calibs <- stds_w_calibs %>% iso_remove_problematic_calibrations("d13C")
+```
+
+### Calibration coefficients
+
+Look at calibration parameters (coefficients and summary) as well as data ranges in overview table.
+
+```{r, echo = FALSE}
+# look at coefficients and summary
+stds_w_calibs %>% 
+  # pull out a little more file information
+  iso_unnest_data(select = c(`Seed Oxidation`)) %>% 
+  # unnest calibration parameters
+  iso_unnest_calibration_parameters(
+    calibration = "d13C", 
+    select_from_coefs = c(term, estimate, SE = std.error, signif),
+    select_from_summary = c(fit_R2 = adj.r.squared, fit_RMSD = deviance, residual_df = df.residual)) %>% 
+  arrange(term)
+
+# look at ranges
+stds_w_calibs %>% 
+  iso_unnest_calibration_range(
+    calibration = "d13C",
+    select = c(var, min, max)
+  ) %>% 
+  arrange(var)
+```
+
+Visualize the calibration parameters
+
+```{r "calibration_parameters", fig.width = 8, fig.height = 8}
+# unnest some of the data for plotting
+data_for_plots <- 
+  stds_w_calibs %>%
+  iso_unnest_data(
+    c(Oxidation = `Seed Oxidation`, 
+      datetime = file_datetime,
+      `Mean Amplitude` = ampl_sample_mean.mV)
+  ) 
+data_for_plots
+
+
+# parameters vs time
+data_for_plots %>%
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = datetime,
+    color = `Mean Amplitude`,
+    shape = Oxidation
+  )
+
+# parameter vs analysis
+data_for_plots %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = paste(Analysis),
+    color = `Mean Amplitude`,
+    shape = Oxidation
+  )
+
+# parameters vs amplitude
+data_for_plots %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C", 
+    x = `Mean Amplitude`
+  ) 
+```
+
+
+```{r "interactive_calibration_parameters", fig.width = 8, fig.height = 8}
+# turn the last plot into an interactive one
+ggplotly(ggplot2::last_plot() + theme(legend.position = "none"))
+```
+
+### Inspect Residuals
+
+Look at residuals to see goodness of fit for the single analysis calibrations.
+
+```{r "standards_by_compound", fig.width = 8, fig.height = 8}
+stds_w_calibs %>% 
+  # pull out all data
+  iso_unnest_data(select = everything()) %>% 
+  filter(is_standard) %>% 
+  # calculate deviation from means
+  group_by(file_id) %>% 
+  mutate(
+    `Var: residual d13C [permil]` = d13C_resid,
+    `Var: area diff from mean [%]` = (`Intensity 44`/mean(`Intensity 44`) - 1) * 100,
+    `Var: amplitude diff from mean [%]` = (`Ampl 44`/mean(`Ampl 44`) - 1) * 100
+  ) %>%
+  ungroup() %>% 
+  # visualize
+  iso_plot_data(
+    x = compound,
+    y = starts_with("Var"),
+    group = file_id
+  ) +
+  # plot modifications
+  labs(x = "")
+```
+
+```{r "interactive", fig.width = 8, fig.height = 8}
+ggplotly()
+```
+
+## Gobal calibration
+
+### Test different calibration models
+
+Run global calibrations across all standards.
+
+```{r, echo = FALSE}
+#original
+data_w_calibs <- data_w_stds %>% 
+  # no grouping this time, everything is part of the global calibration
+  iso_prepare_for_calibration() %>% 
+  # run calibrations
+  iso_generate_calibration(
+    model = c(
+      # simple model
+      delta_only = lm(`d 13C/12C` ~ true_d13C),
+      # multivariate with delta and amplitude (could also check Intensity 44)
+      delta_and_ampl = lm(`d 13C/12C` ~ true_d13C + `Ampl 44`),
+      # + the delta and amplitude cross term
+      delta_cross_ampl = lm(`d 13C/12C` ~ true_d13C * `Ampl 44`),
+      # multivariate with delta and the datetime (i.e. checking for temporal drift)
+      delta_and_time = lm(`d 13C/12C` ~ true_d13C + file_datetime)
+    ), 
+    calibration = "d13C",
+    # important to identify which analyses and which peaks within those should
+    # be part of the calibration
+    is_standard = type == "standard" & is_standard
+  ) %>% 
+  iso_remove_problematic_calibrations("d13C")
+```
+
+
+Visualize the calibration parameters for the different models. 
+
+```{r "global_calibration_parameters", fig.width = 7, fig.height = 10}
+# coefficient summary table
+data_w_calibs %>% iso_unnest_calibration_parameters("d13C")
+
+# plot to look at coefficients and summary
+data_w_calibs %>% 
+  iso_plot_calibration_parameters(
+    calibration = "d13C",
+    x = d13C_calib,
+    color = d13C_calib,
+    # include the significance level to gauge which model parameters matter
+    shape = signif
+  )
+```
+
+It looks like the more complex calibration models don't really add any value here. Check out the residuals to double check. It's clear from the residuals that the models all perform similarly well across all the standards. Because the simplest model that makes physical sense and captures the variation typically is the best to use, we're going with the `delta_only` model in this case.
+
+```{r "global_calibration_residuals", fig.width=8, fig.height=6}
+data_w_calibs %>% 
+  iso_unnest_data(select = everything()) %>% 
+  rename(`Injection Volume` = `Identifier 2`) %>% 
+  filter(type == "standard" & is_standard) %>% 
+  # plot each standard analysis for each of the models to see the differences
+  iso_plot_data(
+    x = compound,
+    y = d13C_resid,
+    group = paste(Analysis, d13C_calib),
+    color = d13C_calib
+  ) 
+```
+
+
+### Apply calibration
+
+Apply the `delta_only` calibration. 
+
+```{r, echo = FALSE}
+data_calibrated <- data_w_calibs %>% 
+  # apply just the delta_only calibration (could apply multiple and compare)
+  filter(d13C_calib == "delta_only") %>% 
+  iso_apply_calibration(
+    predict = true_d13C,
+    calibration = "d13C",
+    calculate_error = TRUE
+  ) %>% 
+  # unnest the data
+  iso_unnest_data()
+data_calibrated
+```
+
+### Inspect results
+
+The comparison of the predicted value in the standards along with the standard error in the prediction (the inherent error of the global calibration itself, which should be treated as the analytical error) can give a better sense of how precise the data is. 
+
+```{r, echo = FALSE}
+data_calibrated %>% 
+  # look only at the standards
+  filter(type == "standard" & is_standard) %>% 
+  # check for each compound (+ other run groupings if appropriate)
+  group_by(compound) %>% 
+  # generate summary table comparing the 
+  iso_generate_summary_table(
+    raw_d13C = `d 13C/12C`, 
+    true_d13C, 
+    # this is the value predicated by the calibration
+    d13C_pred = true_d13C_pred, 
+    # and this is the estimated error based on the calibration
+    d13C_error = true_d13C_pred_se
+  )
+```
+
+### Visualization
+
+Many different ways exist to visualize the data. Regardless of the plotting method it is helpful to keep in mind that the calibration provides not just the predicted value of a peak but also the standard error based on the calibration and an indicator whether a predicted data point was in the calibration range or not. 
+
+```{r "data_visualization", fig.width=12, fig.height=10}
+data_calibrated %>% 
+  iso_plot_data(
+    x = Analysis, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se,
+    color = true_d13C_pred_in_range,
+    shape = type,
+    points = TRUE,
+    lines = FALSE
+  ) + 
+  # additional features beyond the default plot
+  facet_wrap(~compound, scales = "free_y") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(color = "in calib. range")
+```
+
+# Plots with Data
+## all relevant
+```{r "", fig.width=12, fig.height=10}
+data_calibrated %>% 
+  filter(compound %in% c("pristane", "phytane", "C19", "C21", "C23",  "C27", "C29", "C31", "C33"), true_d13C_pred_in_range == TRUE)%>%
+  iso_plot_data(
+    x = Depth, 
+    y = true_d13C_pred, 
+    y_error = true_d13C_pred_se
+  ) + 
+  # additional features beyond the default plot
+  facet_wrap(~compound, scales = "free_y") + 
+  geom_point() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(color = "in calib. range") +
+  scale_x_reverse() +
+  coord_flip()
+```
+
+
+# export to combine with other data for final plots (see 20180619_GB_SH1_adducts.Rmd)
+```{r}
+final_lowres <- data_calibrated %>% filter(Analysis != 493) %>% filter(Analysis != 495) %>%
+  select(
+      # sample info
+      `file_id`, `compound`, `Identifier 1`, depth = `Depth`,  `measurement_info`, `ampl_sample_mean.mV`, `file_datetime`, `type` , 
+      # peak info
+       `Ampl 44`, true_d13C,  true_d13C_pred , true_d13C_pred_se, true_d13C_pred_in_range,  d13C_resid
+    ) %>% apply(.,2,as.character)
+
+```
+
+```{r}
+write.csv(final_lowres, file = "lowres_d13c.csv")
+```
+

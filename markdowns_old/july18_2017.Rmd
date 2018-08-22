@@ -1,0 +1,107 @@
+---
+title: "July18_2017"
+author: "Garrett"
+date: "7/18/2017"
+output: html_document
+---
+
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(knitr)
+library(readxl)
+library(tidyr)
+source("functions.R")
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "smoky_hollows_july")) ### CHANGE PLOT PREFIX ###
+```
+
+
+## Load data
+
+```{r}
+raw <- 
+  bind_rows(
+    read_excel(file.path("data", "20170718__data_export.xlsx")) 
+  ) %>% 
+  select(File, Nr., Start, Rt, End, # filename and retention times
+         Ampl44=`Ampl 44`, Ampl45=`Ampl 45`, # amplitudes
+         Area44=`rIntensity 44`, Area45=`rIntensity 45`, # areas
+         Intensity=`Intensity All`, #peak intensities
+         R13C = `R 13C/12C`, d13C = `13C/12C` # ratio and delta values
+  )
+```
+
+```{r, echo=FALSE, eval=FALSE}
+# file names
+raw$File %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+```{r, echo=FALSE, eval=FALSE}
+# look at single run
+### CHANGE ###
+raw  %>% filter(File =="1309__170718_A5_PTV_1_5_A5dilutionsTest_CO2_newVial_14ng@ul.dxf")  %>% View()
+```
+
+### Map peaks
+
+```{r}
+### CHANGE MAPPING FILE NAME ###
+data_matched <- map_peaks(raw, metadata_file = file.path("metadata", "smoky_hollow_peaks_July18.xlsx"), quiet = FALSE)
+```
+
+### Add standard values
+
+```{r}
+standards <- read_excel(file.path("metadata", "gc_irms_indiana_A6.xlsx"))
+data_w_stds <- data_matched %>% 
+  filter(type == "standard", is_ref_peak == "no") %>% 
+  left_join(standards, by = "compound") %>% 
+  mutate(is_std = !is.na(true.d13C) | !is.na(true.d2H))
+```
+
+## Evaluate standards
+
+### Visualize
+
+```{r, fig.width = 9, fig.height=6}
+data_w_stds %>% 
+  ggplot() +
+  aes(x = true.d13C, y = d13C, color = File) + 
+  geom_smooth(method = "lm", se = FALSE, alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+```
+
+### Overview
+
+```{r}
+std_corrections <- 
+  data_w_stds %>% 
+  group_by(File) %>% 
+  do({
+    m <- lm(d13C ~ true.d13C, data = .)
+    data_frame(
+      offset = coefficients(m)[1],
+      slope = coefficients(m)[2],
+      delta_ref_CO = -offset/slope,
+      max_residual = max(summary(m)$residuals),
+      rss = sum(summary(m)$residuals^2),
+      r2 = summary(m)$r.squared
+    )
+  }) 
+std_corrections %>% knitr::kable(d = 3)
+```
+
+
+
+
